@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Motion Capture</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
+  #row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  #stage { position: relative; background: #000; }
+  #stage.sil video { opacity: 0; }
+  video, #canvas { width: 720px; max-width: 100vw; transform: scaleX(-1); display: block; }
+  #canvas { position: absolute; inset: 0; }
+  #view3d { background: #1b1b1b; max-width: 100vw; }
+  #hud { font-size: 22px; margin: 12px; min-height: 1.4em; }
+  #log { font: 14px monospace; height: 8em; overflow: auto; width: 720px; max-width: 100vw; opacity: .7; white-space: pre; }
+  button { font-size: 16px; padding: 4px 12px; }
+  #orient { font: 18px monospace; white-space: pre; margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="hud">モデル読み込み中…</div>
+<div id="row">
+  <div id="stage"><video id="video" autoplay playsinline muted></video><canvas id="canvas"></canvas></div>
+  <div>
+    <canvas id="view3d" width="480" height="480"></canvas><br>
+    <label>回転 <input id="yaw" type="range" min="-180" max="180" value="0"></label>
+    <button id="poseOn">全身: ON</button>
+    <button id="faceOn">顔: ON</button>
+    <button id="calib">キャリブレーション</button>
+    <button id="silhouette">シルエット: OFF</button>
+    <button id="silgpu">輪郭処理: GPU</button>
+    <button id="bgreset">背景リセット</button>
+    <div id="orient"></div>
+  </div>
+</div>
+<div id="log"></div>
+
+<script type="module">
+import { FilesetResolver, GestureRecognizer, PoseLandmarker, FaceLandmarker, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import { smooth, prune } from "./oneeuro.js";
+import { toward, facing, bodyNormal, bodyFacing, palmNormal, posePalm, armSides, applyCalibration, fingerBends } from "./orient.js";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), v3 = $("view3d"), hud = $("hud"), logEl = $("log");
+const ctx = canvas.getContext("2d"), ctx3 = v3.getContext("2d");
+const draw = new DrawingUtils(ctx);
+
+// ここにジェスチャーごとの処理を書く
+function onGesture(name, hand) {
+  logEl.textContent = `${new Date().toLocaleTimeString()} ${hand} ${name}\n` + logEl.textContent;
+}
+
+const MODELS = "https://storage.googleapis.com/mediapipe-models";
+const vision = await FilesetResolver.forVisionTasks(
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+const opts = path => ({ baseOptions: { modelAssetPath: `${MODELS}/${path}`, delegate: "GPU" }, runningMode: "VIDEO" });
+
+const recognizer = await GestureRecognizer.createFromOptions(vision, {
+  ...opts("gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"),
+  numHands: 2,
+});
+// heavy = 最高精度。重ければ full / lite に変更
+const poser = await PoseLandmarker.createFromOptions(vision, {
+  ...opts("pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"),
+  numPoses: 1,
+  outputSegmentationMasks: true, // シルエットモード用
+});
+const facer = await FaceLandmarker.createFromOptions(vision, {
+  ...opts("face_landmarker/face_landmarker/float16/1/face_landmarker.task"),
+  numFaces: 1,
+  outputFaceBlendshapes: true,
+  outputFacialTransformationMatrixes: true,
+});
+
+hud.textContent = "カメラ起動中…";
+video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+await new Promise(r => video.onloadeddata = r);
+canvas.width = video.videoWidth;
+canvas.height = video.videoHeight;
+
+// --- 3D表示(姿勢ワールド座標 + 手を手首に接続) ---
+const SCALE = 200; // px / m
+function draw3d(pose, handsW) {
+  ctx3.clearRect(0, 0, v3.width, v3.height);
+  if (!pose) return;
+  const a = $("yaw").value * Math.PI / 180;
+  const P = p => [v3.width / 2 - (p.x * Math.cos(a) + p.z * Math.sin(a)) * SCALE, v3.height / 2 + p.y * SCALE];
+  const lines = (lm, conns, color) => {
+    ctx3.strokeStyle = color;
+    ctx3.beginPath();
+    for (const { start, end } of conns) { ctx3.moveTo(...P(lm[start])); ctx3.lineTo(...P(lm[end])); }
+    ctx3.stroke();
+  };
+  ctx3.lineWidth = 3;
+  lines(pose, PoseLandmarker.POSE_CONNECTIONS, "#fa0");
+  ctx3.lineWidth = 1.5;
+  for (const lm of Object.values(handsW)) lines(lm, GestureRecognizer.HAND_CONNECTIONS, "#0f0");
+}
+
+// 手のワールド座標(手の中心原点)を姿勢の手首位置へ移動
+const WRIST = { Left: 15, Right: 16 };
+const attach = (hw, pose, hand) => {
+  const w = pose[WRIST[hand]];
+  return hw.map(p => ({ x: p.x - hw[0].x + w.x, y: p.y - hw[0].y + w.y, z: p.z - hw[0].z + w.z }));
+};
+
+// --- シルエットモード(姿勢モデルのセグメンテーションマスク) ---
+const SIL_THRESHOLD = 0.5; // 人物と見なすマスク値
+let silhouette = false;
+$("silhouette").onclick = () => {
+  silhouette = !silhouette;
+  $("silhouette").textContent = `シルエット: ${silhouette ? "ON" : "OFF"}`;
+  $("stage").classList.toggle("sil", silhouette);
+};
+const SIL_LINE = 2; // 輪郭線の太さ(マスクのピクセル単位、GPU版は最大8)
+const resize = (c, w, h) => { if (c.width !== w || c.height !== h) Object.assign(c, { width: w, height: h }); };
+
+// 輪郭 = 内側の点のうち、上下左右 SIL_LINE 以内に外側がある点
+// CPU版: 全画素を走査(人物が画面いっぱいで約30ms)
+const cpuCanvas = document.createElement("canvas");
+const cpuCtx = cpuCanvas.getContext("2d");
+function edgeCPU(m, w, h) {
+  const inside = (x, y) => x >= 0 && y >= 0 && x < w && y < h && m[y * w + x] >= SIL_THRESHOLD;
+  resize(cpuCanvas, w, h);
+  const img = cpuCtx.createImageData(w, h), d = img.data;
+  for (let y = 0, i = 0; y < h; y++) {
+    for (let x = 0; x < w; x++, i++) {
+      if (m[i] < SIL_THRESHOLD) continue;
+      for (let k = 1; k <= SIL_LINE; k++) {
+        if (!inside(x - k, y) || !inside(x + k, y) || !inside(x, y - k) || !inside(x, y + k)) {
+          d[i * 4 + 1] = 200; d[i * 4 + 2] = 255; d[i * 4 + 3] = 255;
+          break;
+        }
+      }
+    }
+  }
+  cpuCtx.putImageData(img, 0, 0);
+  return cpuCanvas;
+}
+
+// GPU版(指補正つき)。3パスで処理する
+//  1. person: 手の骨格の周りは「背景との色差」、それ以外は全身モデルのマスクで人物を判定
+//  2. bg    : 人物でも手の周りでもない画素だけ、背景を少しずつ学習
+//  3. edge  : 人物マスクから輪郭線を描く
+// ponytail: マスクは一度CPUに読み出してから再アップロードしている。さらに詰めるなら
+// MediaPipe と同じ canvas を共有して mask.getAsWebGLTexture() を直接使う
+const DIFF_T = 0.12;   // 背景との色差がこれ以上なら人物(0〜1.7)。指が欠ける→下げる / ノイズが出る→上げる
+const BG_RATE = 0.05;  // 背景の学習速度(1フレームあたり)
+const FINGER_K = 0.13; // 指の太さ(半径) = 手のひら幅 × これ。背景未学習の場所で使う
+const ZONE_K = 0.45;   // 色差で判定する範囲(骨格からの距離) = 手のひら幅 × これ
+
+const glCanvas = document.createElement("canvas");
+const gl = glCanvas.getContext("webgl2", { premultipliedAlpha: false, preserveDrawingBuffer: true });
+const BONES = GestureRecognizer.HAND_CONNECTIONS;
+let P, T = {}, fbo, bgRead, bgWrite, glW = 0, glH = 0;
+
+function program(fs) {
+  const sh = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, `#version 300 es
+    layout(location = 0) in vec2 p; out vec2 uv; uniform float flip;
+    // uv は常に画像座標(上=0)。FBO(flip=+1)と画面(flip=-1)で行の上下が逆なので切り替える
+    void main() { uv = vec2(p.x * 0.5 + 0.5, 0.5 + flip * 0.5 * p.y); gl_Position = vec4(p, 0, 1); }`));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, "#version 300 es\nprecision highp float;\n" + fs));
+  gl.linkProgram(p);
+  const cache = {};
+  return { p, u: name => cache[name] ??= gl.getUniformLocation(p, name) };
+}
+
+function texture(filter) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, k, filter);
+  for (const k of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D, k, gl.CLAMP_TO_EDGE);
+  return t;
+}
+const rgbaTarget = (w, h) => {
+  const t = texture(gl.NEAREST);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  return t;
+};
+
+if (gl) {
+  P = {
+    person: program(`
+      uniform sampler2D mask, frame, bg;
+      uniform vec2 size; uniform float th, diffT;
+      uniform vec2 pts[42]; uniform float fr[2], zr[2]; uniform int nh;
+      const ivec2 B[${BONES.length}] = ivec2[](${BONES.map(b => `ivec2(${b.start},${b.end})`).join(",")});
+      in vec2 uv; out vec4 o;
+      float seg(vec2 p, vec2 a, vec2 b) {
+        vec2 ab = b - a;
+        float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+        return length(p - a - ab * t);
+      }
+      float diffAt(vec2 q) { return length(texture(frame, q).rgb - texture(bg, q).rgb); }
+      void main() {
+        vec2 p = uv * size, px = 1.0 / size;
+        bool nn = texture(mask, uv).r >= th;
+        bool zone = false, core = false, half_ = false;
+        for (int h = 0; h < nh; h++) {
+          float d = 1e9;
+          for (int i = 0; i < ${BONES.length}; i++) d = min(d, seg(p, pts[h * 21 + B[i].x], pts[h * 21 + B[i].y]));
+          zone = zone || d < zr[h];
+          core = core || d < fr[h];
+          half_ = half_ || d < fr[h] * 0.5;
+        }
+        bool person = nn;
+        if (zone) {
+          if (texture(bg, uv).a < 0.5) {
+            person = nn || core; // 背景未学習: 骨格を指の太さに膨らませて代用
+          } else {
+            // 5点平均の色差でノイズを抑える
+            float df = (diffAt(uv) + diffAt(uv + vec2(px.x, 0)) + diffAt(uv - vec2(px.x, 0))
+                      + diffAt(uv + vec2(0, px.y)) + diffAt(uv - vec2(0, px.y))) / 5.0;
+            person = df > diffT || half_;
+          }
+        }
+        // r=人物, g=背景として学習してよい
+        o = vec4(person ? 1.0 : 0.0, (!nn && !zone) ? 1.0 : 0.0, 0, 1);
+      }`),
+    bg: program(`
+      uniform sampler2D bg, frame, pm; uniform float rate;
+      in vec2 uv; out vec4 o;
+      void main() {
+        vec4 b = texture(bg, uv);
+        vec3 f = texture(frame, uv).rgb;
+        if (texture(pm, uv).g < 0.5) o = b;
+        else if (b.a < 0.01) o = vec4(f, rate);  // 初めて見えた画素はそのまま採用
+        else o = vec4(mix(b.rgb, f, rate), mix(b.a, 1.0, rate));
+      }`),
+    edge: program(`
+      uniform sampler2D m; uniform vec2 px; uniform int line;
+      in vec2 uv; out vec4 o;
+      bool inside(vec2 q) {
+        if (q.x < 0.0 || q.y < 0.0 || q.x > 1.0 || q.y > 1.0) return false;
+        return texture(m, q).r >= 0.5;
+      }
+      void main() {
+        o = vec4(0);
+        if (!inside(uv)) return;
+        for (int k = 1; k <= 8; k++) {
+          if (k > line) break;
+          vec2 d = px * float(k);
+          if (!inside(uv - vec2(d.x, 0)) || !inside(uv + vec2(d.x, 0)) ||
+              !inside(uv - vec2(0, d.y)) || !inside(uv + vec2(0, d.y))) {
+            o = vec4(0, 200.0 / 255.0, 1, 1);
+            return;
+          }
+        }
+      }`),
+  };
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  T.mask = texture(gl.NEAREST);
+  T.frame = texture(gl.LINEAR);
+  fbo = gl.createFramebuffer();
+}
+
+function resetBackground() {
+  if (!gl || !glW) return;
+  for (const t of [bgRead, bgWrite]) {
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, glW, glH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  }
+}
+
+// 描画先(null=画面)とテクスチャ割り当てを決めて1パス描く
+function pass(prog, target, texs) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? fbo : null);
+  if (target) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+  gl.useProgram(prog.p);
+  gl.uniform1f(prog.u("flip"), target ? 1 : -1);
+  Object.entries(texs).forEach(([name, t], i) => {
+    gl.activeTexture(gl.TEXTURE0 + i);
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.uniform1i(prog.u(name), i);
+  });
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function edgeGPU(m, w, h, handLms, frame) {
+  if (w !== glW || h !== glH) {
+    [glW, glH] = [w, h];
+    resize(glCanvas, w, h);
+    T.person = rgbaTarget(w, h);
+    bgRead = rgbaTarget(w, h);
+    bgWrite = rgbaTarget(w, h);
+  }
+  gl.viewport(0, 0, w, h);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, T.mask);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, m);
+  gl.bindTexture(gl.TEXTURE_2D, T.frame);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+
+  // 手の骨格をマスクのピクセル座標で渡す。太さは手のひらの大きさから決める
+  const pts = new Float32Array(84), fr = new Float32Array(2), zr = new Float32Array(2);
+  const hands = handLms.slice(0, 2);
+  hands.forEach((lm, hi) => {
+    lm.forEach((q, i) => pts.set([q.x * w, q.y * h], (hi * 21 + i) * 2));
+    const dist = (a, b) => Math.hypot((lm[a].x - lm[b].x) * w, (lm[a].y - lm[b].y) * h);
+    const palm = Math.max(dist(5, 17), dist(0, 9) * 0.8);
+    fr[hi] = palm * FINGER_K;
+    zr[hi] = palm * ZONE_K;
+  });
+  const pp = P.person;
+  gl.useProgram(pp.p);
+  gl.uniform2f(pp.u("size"), w, h);
+  gl.uniform1f(pp.u("th"), SIL_THRESHOLD);
+  gl.uniform1f(pp.u("diffT"), DIFF_T);
+  gl.uniform2fv(pp.u("pts"), pts);
+  gl.uniform1fv(pp.u("fr"), fr);
+  gl.uniform1fv(pp.u("zr"), zr);
+  gl.uniform1i(pp.u("nh"), hands.length);
+  pass(pp, T.person, { mask: T.mask, frame: T.frame, bg: bgRead });
+
+  gl.useProgram(P.bg.p);
+  gl.uniform1f(P.bg.u("rate"), BG_RATE);
+  pass(P.bg, bgWrite, { bg: bgRead, frame: T.frame, pm: T.person });
+  [bgRead, bgWrite] = [bgWrite, bgRead];
+
+  gl.useProgram(P.edge.p);
+  gl.uniform2f(P.edge.u("px"), 1 / w, 1 / h);
+  gl.uniform1i(P.edge.u("line"), SIL_LINE);
+  pass(P.edge, null, { m: T.person });
+  return glCanvas;
+}
+
+let silGPU = !!gl;
+const silLabel = () => $("silgpu").textContent = `輪郭処理: ${silGPU ? "GPU(指補正)" : "CPU(補正なし)"}`;
+silLabel();
+$("silgpu").disabled = !gl; // WebGL2 が無ければ CPU 固定
+$("silgpu").onclick = () => { silGPU = !silGPU; silLabel(); };
+$("bgreset").onclick = resetBackground;
+
+// 面積率と外接矩形。step 画素おきに間引いて数える
+function maskStats(m, w, h, step) {
+  let n = 0, cnt = 0, x0 = w, y0 = h, x1 = -1, y1 = -1;
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      n++;
+      if (m[y * w + x] < SIL_THRESHOLD) continue;
+      cnt++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  }
+  if (!cnt) return null;
+  return { area: cnt / n, x0, y0, x1: Math.min(w - 1, x1 + step - 1), y1: Math.min(h - 1, y1 + step - 1) };
+}
+
+// 人物の輪郭を線で描き、人物の面積率・縦横比・処理時間を返す
+function drawSilhouette(mask, handLms) {
+  const t0 = performance.now();
+  const w = mask.width, h = mask.height, m = mask.getAsFloat32Array();
+  ctx.drawImage(silGPU ? edgeGPU(m, w, h, handLms, video) : edgeCPU(m, w, h), 0, 0, canvas.width, canvas.height);
+  const s = maskStats(m, w, h, silGPU ? 2 : 1);
+  if (!s) return null;
+  const sx = canvas.width / w, sy = canvas.height / h;
+  const bw = s.x1 - s.x0 + 1, bh = s.y1 - s.y0 + 1;
+  ctx.strokeStyle = "#ff0";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(s.x0 * sx, s.y0 * sy, bw * sx, bh * sy);
+  return { area: s.area, aspect: bh / bw, ms: performance.now() - t0 };
+}
+
+// --- キャリブレーション(正面を向き、両手のひらをカメラへ) ---
+const CALIB_WAIT = 3000, CALIB_MEASURE = 1500;
+let calibRun = null; // { start, samples }
+$("calib").onclick = () => calibRun = { start: performance.now() + CALIB_WAIT, samples: {} };
+const pushSample = (key, v) => (calibRun.samples[key] ??= []).push(v);
+
+// --- ジェスチャー系 ---
+const SWIPE_DIST = 0.25, SWIPE_MS = 400; // 感度調整用
+const JOIN_DIST = 0.12, SPLIT_DIST = 0.2; // 手を合わせた/離したと見なす距離(画面の高さ比)
+const TIPS = [4, 8, 12, 16, 20];          // 親指〜小指の指先
+let linked = false;   // 指先の線が有効か
+let joined = false;   // 現在手を合わせているか(離すまで再トグルしない)
+const last = {};    // hand -> 直前に通知したジェスチャー
+const trail = {};   // hand -> [{t, x}] 手首のx座標履歴
+
+function detectSwipe(hand, x, t) {
+  const tr = (trail[hand] ??= []);
+  tr.push({ t, x });
+  while (tr[0].t < t - SWIPE_MS) tr.shift();
+  const dx = x - tr[0].x;
+  if (Math.abs(dx) < SWIPE_DIST) return null;
+  tr.length = 0;
+  // 映像は鏡像表示なので、画像座標のxが減る = 画面上で右へ
+  return dx < 0 ? "Swipe_Right" : "Swipe_Left";
+}
+
+// --- 全身・顔の処理 ON/OFF ---
+const enabled = { pose: true, face: true };
+for (const [key, id, label] of [["pose", "poseOn", "全身"], ["face", "faceOn", "顔"]]) {
+  $(id).onclick = () => {
+    enabled[key] = !enabled[key];
+    $(id).textContent = `${label}: ${enabled[key] ? "ON" : "OFF"}`;
+  };
+}
+
+let lastVideoTime = -1, fps = 0, lastT = performance.now();
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (video.currentTime === lastVideoTime) return; // 同じフレームを二重処理しない
+  lastVideoTime = video.currentTime;
+  const t = performance.now();
+  fps += (1000 / (t - lastT) - fps) * 0.1;
+  lastT = t;
+
+  // OFF の処理はモデルを動かさず、空の結果として扱う
+  const poseRes = enabled.pose ? poser.detectForVideo(video, t) : { landmarks: [], worldLandmarks: [], segmentationMasks: [] };
+  const faceRes = enabled.face ? facer.detectForVideo(video, t) : { faceLandmarks: [], faceBlendshapes: [] };
+  const res = recognizer.recognizeForVideo(video, t);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // シルエット(マスクは使い終わったら必ず close する)
+  let sil = null;
+  if (silhouette && poseRes.segmentationMasks?.[0]) sil = drawSilhouette(poseRes.segmentationMasks[0], res.landmarks);
+  poseRes.segmentationMasks?.forEach(m => m.close());
+
+  // 顔
+  const face = faceRes.faceLandmarks[0] && smooth("face", faceRes.faceLandmarks[0], t);
+  if (face) draw.drawConnectors(face, FaceLandmarker.FACE_LANDMARKS_TESSELATION, { color: "#ffffff40", lineWidth: 1 });
+
+  // 全身
+  const pose2d = poseRes.landmarks[0] && smooth("pose2d", poseRes.landmarks[0], t);
+  const poseW = poseRes.worldLandmarks[0] && smooth("poseW", poseRes.worldLandmarks[0], t);
+  if (pose2d) {
+    draw.drawConnectors(pose2d, PoseLandmarker.POSE_CONNECTIONS, { color: "#fa0", lineWidth: 3 });
+    draw.drawLandmarks(pose2d, { color: "#fff", radius: 2 });
+  }
+
+  // 手
+  const labels = [];
+  const hands = {}, handsW = {}, palms = {}, bends = {};
+  res.landmarks.forEach((raw, i) => {
+    // 鏡像なので左右ラベルを反転(=本人の左右)
+    const hand = res.handedness[i][0].categoryName === "Left" ? "Right" : "Left";
+    if (hands[hand]) return; // 同じ側が2つ出たら先の方だけ採用
+    const lm = hands[hand] = smooth(`hand2d${hand}`, raw, t);
+    const hw = smooth(`handW${hand}`, res.worldLandmarks[i], t);
+    bends[hand] = fingerBends(hw);
+    if (poseW) handsW[hand] = attach(hw, poseW, hand);
+    palms[hand] = palmNormal(hw[0], hw[5], hw[17], hand, "hand");
+    // 手のひら側が見えていれば緑、甲なら青
+    const color = toward(palms[hand], "p", "b") === "b" ? "#08f" : "#0f0";
+    draw.drawConnectors(lm, GestureRecognizer.HAND_CONNECTIONS, { color, lineWidth: 3 });
+    draw.drawLandmarks(lm, { color: "#f00", radius: 2 });
+
+    const g = res.gestures[i][0];
+    const name = g.categoryName === "None" ? "-" : g.categoryName;
+    labels.push(`${hand}: ${name}`);
+    if (name !== "-" && name !== last[hand]) onGesture(name, hand);
+    last[hand] = name;
+
+    const swipe = detectSwipe(hand, lm[0].x, t);
+    if (swipe) onGesture(swipe, hand);
+  });
+  prune();
+  for (const h in last) if (!hands[h]) { delete last[h]; delete trail[h]; }
+
+  const { Left: L, Right: R } = hands;
+  if (L && R) {
+    // 手のひら中心(9番)同士の距離。xは縦横比で補正
+    const d = Math.hypot((L[9].x - R[9].x) * canvas.width / canvas.height, L[9].y - R[9].y);
+    if (!joined && d < JOIN_DIST) {
+      joined = true;
+      linked = !linked;
+      onGesture(linked ? "Link_On" : "Link_Off", "Both");
+    } else if (joined && d > SPLIT_DIST) {
+      joined = false;
+    }
+    if (linked) {
+      ctx.strokeStyle = "#0ff";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      for (const k of TIPS) {
+        ctx.moveTo(L[k].x * canvas.width, L[k].y * canvas.height);
+        ctx.lineTo(R[k].x * canvas.width, R[k].y * canvas.height);
+      }
+      ctx.stroke();
+    }
+  }
+
+  draw3d(poseW, handsW);
+
+  let calibMsg = "";
+  if (calibRun) {
+    const remain = calibRun.start - t;
+    if (remain > 0) {
+      calibMsg = `正面を向き、両手のひらをカメラに向けてください… ${Math.ceil(remain / 1000)}`;
+    } else if (remain > -CALIB_MEASURE) {
+      calibMsg = "計測中…そのまま";
+      if (poseW) {
+        pushSample("body", facing(bodyNormal(poseW)));
+        for (const h of ["Left", "Right"]) {
+          pushSample(`pose:${h}`, facing(posePalm(poseW, h)));
+          if (palms[h]) pushSample(`hand:${h}`, facing(palms[h]));
+        }
+      }
+    } else {
+      onGesture(`Calibrated ${JSON.stringify(applyCalibration(calibRun.samples))}`, "-");
+      calibRun = null;
+    }
+  }
+
+  // 指の握り込み率(0%=伸展, 100%=握り込み)
+  const fingerLines = [["Left", "左"], ["Right", "右"]].filter(([h]) => bends[h]).map(([h, jp]) =>
+    `${jp}指  : ` + bends[h].map(f => `${f.name}${String(Math.round(f.curl * 100)).padStart(3)}%`).join(" "));
+  const silLine = silhouette && (sil
+    ? `シルエット: 面積 ${(sil.area * 100).toFixed(1)}%  縦横比 ${sil.aspect.toFixed(2)}  ${silGPU ? "GPU" : "CPU"} ${sil.ms.toFixed(1)}ms`
+    : "シルエット: 人物なし");
+
+  if (poseW) {
+    // 顔処理が OFF のときは「顔が見えない=背面」の判定を使わない(null)
+    const lines = [calibMsg, `体    : ${bodyFacing(poseW, enabled.face ? !!face : null)}`];
+    for (const [hand, jp] of [["Left", "左"], ["Right", "右"]]) {
+      const a = armSides(poseW, hand, palms[hand]);
+      lines.push(`${jp}手  : ${a.palm}${palms[hand] ? "" : " (推定)"}`,
+                 `${jp}前腕: ${a.fore}   ${jp}上腕: ${a.upper}`);
+    }
+    $("orient").textContent = [...lines, ...fingerLines, silLine].filter(Boolean).join("\n");
+  } else {
+    $("orient").textContent = [calibMsg, "全身が見えていません", ...fingerLines, silLine].filter(Boolean).join("\n");
+  }
+
+  const mark = (on, found) => on ? (found ? "○" : "×") : "OFF";
+  hud.textContent = `${fps | 0}fps   全身:${mark(enabled.pose, poseW)} 顔:${mark(enabled.face, face)}   `
+    + (labels.join("  ") || "手なし") + (linked ? "  🔗" : "");
+}
+loop();
+</script>
+</body>
+</html>
