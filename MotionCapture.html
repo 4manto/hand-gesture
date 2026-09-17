@@ -15,21 +15,42 @@
   #log { font: 14px monospace; height: 8em; overflow: auto; width: 720px; max-width: 100vw; opacity: .7; white-space: pre; }
   button { font-size: 16px; padding: 4px 12px; }
   #orient { font: 18px monospace; white-space: pre; margin-top: 8px; line-height: 1.5; }
+  [hidden] { display: none !important; }
+  #start { padding: 48px 16px; text-align: center; max-width: 900px; }
+  #start h1 { font-size: 28px; margin: 0 0 8px; }
+  #start p { opacity: .7; margin: 0 0 24px; }
+  .choices { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; }
+  .choices button { width: 240px; padding: 20px; background: #1d2530; color: #eee; border: 1px solid #3a4a5c; border-radius: 10px; cursor: pointer; display: flex; flex-direction: column; gap: 8px; }
+  .choices button:hover, .choices button:focus-visible { background: #26405c; border-color: #6ab0ff; outline: none; }
+  .choices b { font-size: 28px; }
+  .choices span { font-size: 14px; opacity: .8; line-height: 1.5; }
 </style>
 </head>
 <body>
-<div id="hud">モデル読み込み中…</div>
-<div id="row">
+<div id="start">
+  <h1>何を認識しますか?</h1>
+  <p>選んだものだけを読み込んで動かします。あとから「モード変更」で選び直せます。</p>
+  <div class="choices">
+    <button data-mode="hand"><b>手</b><span>ジェスチャー・指の曲がり・手のひら/甲・スワイプ</span></button>
+    <button data-mode="pose"><b>全身</b><span>全身の骨格・体と腕の向き・シルエット</span></button>
+    <button data-mode="face"><b>顔</b><span>顔のメッシュ(478点)・表情</span></button>
+  </div>
+</div>
+<div id="hud" hidden></div>
+<div id="row" hidden>
   <div id="stage"><video id="video" autoplay playsinline muted></video><canvas id="canvas"></canvas></div>
   <div>
-    <canvas id="view3d" width="480" height="480"></canvas><br>
-    <label>回転 <input id="yaw" type="range" min="-180" max="180" value="0"></label>
-    <button id="poseOn">全身: ON</button>
-    <button id="faceOn">顔: ON</button>
-    <button id="calib">キャリブレーション</button>
-    <button id="silhouette">シルエット: OFF</button>
-    <button id="silgpu">輪郭処理: GPU</button>
-    <button id="bgreset">背景リセット</button>
+    <div data-modes="hand pose">
+      <canvas id="view3d" width="480" height="480"></canvas><br>
+      <label>回転 <input id="yaw" type="range" min="-180" max="180" value="0"></label>
+      <button id="calib">キャリブレーション</button>
+    </div>
+    <div data-modes="pose">
+      <button id="silhouette">シルエット: OFF</button>
+      <button id="silgpu">輪郭処理: GPU</button>
+      <button id="bgreset">背景リセット</button>
+    </div>
+    <button id="modeChange">モード変更</button>
     <div id="orient"></div>
   </div>
 </div>
@@ -184,26 +205,36 @@ function onGesture(name, hand) {
   logEl.textContent = `${new Date().toLocaleTimeString()} ${hand} ${name}\n` + logEl.textContent;
 }
 
+// --- 最初にモードを選ぶ(hand / pose / face)。選ばれたモデルだけ読み込む ---
+const mode = await new Promise(resolve => {
+  for (const b of document.querySelectorAll("#start [data-mode]")) b.onclick = () => resolve(b.dataset.mode);
+});
+$("start").hidden = true;
+$("hud").hidden = false;
+$("row").hidden = false;
+for (const el of document.querySelectorAll("[data-modes]")) el.hidden = !el.dataset.modes.split(" ").includes(mode);
+$("modeChange").onclick = () => location.reload();
+hud.textContent = "モデル読み込み中…";
+
 const MODELS = "https://storage.googleapis.com/mediapipe-models";
 const vision = await FilesetResolver.forVisionTasks(
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
 const opts = path => ({ baseOptions: { modelAssetPath: `${MODELS}/${path}`, delegate: "GPU" }, runningMode: "VIDEO" });
 
-const recognizer = await GestureRecognizer.createFromOptions(vision, {
+const recognizer = mode === "hand" && await GestureRecognizer.createFromOptions(vision, {
   ...opts("gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"),
   numHands: 2,
 });
 // heavy = 最高精度。重ければ full / lite に変更
-const poser = await PoseLandmarker.createFromOptions(vision, {
+const poser = mode === "pose" && await PoseLandmarker.createFromOptions(vision, {
   ...opts("pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"),
   numPoses: 1,
   outputSegmentationMasks: true, // シルエットモード用
 });
-const facer = await FaceLandmarker.createFromOptions(vision, {
+const facer = mode === "face" && await FaceLandmarker.createFromOptions(vision, {
   ...opts("face_landmarker/face_landmarker/float16/1/face_landmarker.task"),
   numFaces: 1,
   outputFaceBlendshapes: true,
-  outputFacialTransformationMatrixes: true,
 });
 
 hud.textContent = "カメラ起動中…";
@@ -213,10 +244,10 @@ canvas.width = video.videoWidth;
 canvas.height = video.videoHeight;
 
 // --- 3D表示(姿勢ワールド座標 + 手を手首に接続) ---
-const SCALE = 200; // px / m
+// px / m。手だけのモードは手が小さいので拡大
+const SCALE = mode === "hand" ? 800 : 200;
 function draw3d(pose, handsW) {
   ctx3.clearRect(0, 0, v3.width, v3.height);
-  if (!pose) return;
   const a = $("yaw").value * Math.PI / 180;
   const P = p => [v3.width / 2 - (p.x * Math.cos(a) + p.z * Math.sin(a)) * SCALE, v3.height / 2 + p.y * SCALE];
   const lines = (lm, conns, color) => {
@@ -226,17 +257,16 @@ function draw3d(pose, handsW) {
     ctx3.stroke();
   };
   ctx3.lineWidth = 3;
-  lines(pose, PoseLandmarker.POSE_CONNECTIONS, "#fa0");
+  if (pose) lines(pose, PoseLandmarker.POSE_CONNECTIONS, "#fa0");
   ctx3.lineWidth = 1.5;
   for (const lm of Object.values(handsW)) lines(lm, GestureRecognizer.HAND_CONNECTIONS, "#0f0");
 }
 
-// 手のワールド座標(手の中心原点)を姿勢の手首位置へ移動
+// 手のワールド座標(手の中心原点)を、手首が w に来るよう移動
+// 全身があれば姿勢の手首、手だけのモードでは左右に並べた固定位置
 const WRIST = { Left: 15, Right: 16 };
-const attach = (hw, pose, hand) => {
-  const w = pose[WRIST[hand]];
-  return hw.map(p => ({ x: p.x - hw[0].x + w.x, y: p.y - hw[0].y + w.y, z: p.z - hw[0].z + w.z }));
-};
+const HAND_ONLY_WRIST = { Left: { x: 0.12, y: 0.12, z: 0 }, Right: { x: -0.12, y: 0.12, z: 0 } };
+const attach = (hw, w) => hw.map(p => ({ x: p.x - hw[0].x + w.x, y: p.y - hw[0].y + w.y, z: p.z - hw[0].z + w.z }));
 
 // --- シルエットモード(姿勢モデルのセグメンテーションマスク) ---
 const SIL_THRESHOLD = 0.5; // 人物と見なすマスク値
@@ -536,14 +566,11 @@ function detectSwipe(hand, x, t) {
   return dx < 0 ? "Swipe_Right" : "Swipe_Left";
 }
 
-// --- 全身・顔の処理 ON/OFF ---
-const enabled = { pose: true, face: true };
-for (const [key, id, label] of [["pose", "poseOn", "全身"], ["face", "faceOn", "顔"]]) {
-  $(id).onclick = () => {
-    enabled[key] = !enabled[key];
-    $(id).textContent = `${label}: ${enabled[key] ? "ON" : "OFF"}`;
-  };
-}
+// 選ばれていないモデルは動かさず、空の結果として扱う
+const NO_POSE = { landmarks: [], worldLandmarks: [], segmentationMasks: [] };
+const NO_FACE = { faceLandmarks: [], faceBlendshapes: [] };
+const NO_HAND = { landmarks: [], worldLandmarks: [], handedness: [], gestures: [] };
+const SIDES = [["Left", "左"], ["Right", "右"]];
 
 let lastVideoTime = -1, fps = 0, lastT = performance.now();
 
@@ -555,10 +582,9 @@ function loop() {
   fps += (1000 / (t - lastT) - fps) * 0.1;
   lastT = t;
 
-  // OFF の処理はモデルを動かさず、空の結果として扱う
-  const poseRes = enabled.pose ? poser.detectForVideo(video, t) : { landmarks: [], worldLandmarks: [], segmentationMasks: [] };
-  const faceRes = enabled.face ? facer.detectForVideo(video, t) : { faceLandmarks: [], faceBlendshapes: [] };
-  const res = recognizer.recognizeForVideo(video, t);
+  const poseRes = poser ? poser.detectForVideo(video, t) : NO_POSE;
+  const faceRes = facer ? facer.detectForVideo(video, t) : NO_FACE;
+  const res = recognizer ? recognizer.recognizeForVideo(video, t) : NO_HAND;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   // シルエット(マスクは使い終わったら必ず close する)
@@ -588,7 +614,7 @@ function loop() {
     const lm = hands[hand] = smooth(`hand2d${hand}`, raw, t);
     const hw = smooth(`handW${hand}`, res.worldLandmarks[i], t);
     bends[hand] = fingerBends(hw);
-    if (poseW) handsW[hand] = attach(hw, poseW, hand);
+    handsW[hand] = attach(hw, poseW ? poseW[WRIST[hand]] : HAND_ONLY_WRIST[hand]);
     palms[hand] = palmNormal(hw[0], hw[5], hw[17], hand, "hand");
     // 手のひら側が見えていれば緑、甲なら青
     const color = toward(palms[hand], "p", "b") === "b" ? "#08f" : "#0f0";
@@ -630,7 +656,7 @@ function loop() {
     }
   }
 
-  draw3d(poseW, handsW);
+  if (mode !== "face") draw3d(poseW, handsW);
 
   let calibMsg = "";
   if (calibRun) {
@@ -639,12 +665,10 @@ function loop() {
       calibMsg = `正面を向き、両手のひらをカメラに向けてください… ${Math.ceil(remain / 1000)}`;
     } else if (remain > -CALIB_MEASURE) {
       calibMsg = "計測中…そのまま";
-      if (poseW) {
-        pushSample("body", facing(bodyNormal(poseW)));
-        for (const h of ["Left", "Right"]) {
-          pushSample(`pose:${h}`, facing(posePalm(poseW, h)));
-          if (palms[h]) pushSample(`hand:${h}`, facing(palms[h]));
-        }
+      if (poseW) pushSample("body", facing(bodyNormal(poseW)));
+      for (const [h] of SIDES) {
+        if (poseW) pushSample(`pose:${h}`, facing(posePalm(poseW, h)));
+        if (palms[h]) pushSample(`hand:${h}`, facing(palms[h]));
       }
     } else {
       onGesture(`Calibrated ${JSON.stringify(applyCalibration(calibRun.samples))}`, "-");
@@ -652,29 +676,41 @@ function loop() {
     }
   }
 
-  // 指の握り込み率(0%=伸展, 100%=握り込み)
-  const fingerLines = [["Left", "左"], ["Right", "右"]].filter(([h]) => bends[h]).map(([h, jp]) =>
-    `${jp}指  : ` + bends[h].map(f => `${f.name}${String(Math.round(f.curl * 100)).padStart(3)}%`).join(" "));
-  const silLine = silhouette && (sil
-    ? `シルエット: 面積 ${(sil.area * 100).toFixed(1)}%  縦横比 ${sil.aspect.toFixed(2)}  ${silGPU ? "GPU" : "CPU"} ${sil.ms.toFixed(1)}ms`
-    : "シルエット: 人物なし");
-
-  if (poseW) {
-    // 顔処理が OFF のときは「顔が見えない=背面」の判定を使わない(null)
-    const lines = [calibMsg, `体    : ${bodyFacing(poseW, enabled.face ? !!face : null)}`];
-    for (const [hand, jp] of [["Left", "左"], ["Right", "右"]]) {
-      const a = armSides(poseW, hand, palms[hand]);
-      lines.push(`${jp}手  : ${a.palm}${palms[hand] ? "" : " (推定)"}`,
-                 `${jp}前腕: ${a.fore}   ${jp}上腕: ${a.upper}`);
+  const lines = [calibMsg];
+  if (mode === "hand") {
+    if (!L && !R) lines.push("手が見えていません");
+    for (const [h, jp] of SIDES) {
+      if (!bends[h]) continue;
+      // 指の握り込み率(0%=伸展, 100%=握り込み)
+      lines.push(`${jp}手  : ${toward(palms[h], "手のひら", "手の甲")}`,
+                 `${jp}指  : ` + bends[h].map(f => `${f.name}${String(Math.round(f.curl * 100)).padStart(3)}%`).join(" "));
     }
-    $("orient").textContent = [...lines, ...fingerLines, silLine].filter(Boolean).join("\n");
+  } else if (mode === "pose") {
+    if (poseW) {
+      // 顔は認識していないので「顔が見えない=背面」の補正は使わない(null)
+      lines.push(`体    : ${bodyFacing(poseW, null)}`);
+      for (const [h, jp] of SIDES) {
+        const a = armSides(poseW, h);
+        lines.push(`${jp}手  : ${a.palm} (推定)`, `${jp}前腕: ${a.fore}   ${jp}上腕: ${a.upper}`);
+      }
+    } else {
+      lines.push("全身が見えていません");
+    }
+    if (silhouette) lines.push(sil
+      ? `シルエット: 面積 ${(sil.area * 100).toFixed(1)}%  縦横比 ${sil.aspect.toFixed(2)}  ${silGPU ? "GPU" : "CPU"} ${sil.ms.toFixed(1)}ms`
+      : "シルエット: 人物なし");
   } else {
-    $("orient").textContent = [calibMsg, "全身が見えていません", ...fingerLines, silLine].filter(Boolean).join("\n");
+    // 表情の強い順に上位6つ(0〜1)
+    const top = (faceRes.faceBlendshapes[0]?.categories ?? [])
+      .filter(c => c.categoryName !== "_neutral")
+      .sort((a, b) => b.score - a.score).slice(0, 6);
+    lines.push(face ? "表情(上位):" : "顔が見えていません",
+      ...top.map(c => `  ${c.categoryName.padEnd(18)} ${c.score.toFixed(2)}`));
   }
+  $("orient").textContent = lines.filter(Boolean).join("\n");
 
-  const mark = (on, found) => on ? (found ? "○" : "×") : "OFF";
-  hud.textContent = `${fps | 0}fps   全身:${mark(enabled.pose, poseW)} 顔:${mark(enabled.face, face)}   `
-    + (labels.join("  ") || "手なし") + (linked ? "  🔗" : "");
+  const found = { hand: labels.join("  ") || "手なし", pose: `全身:${poseW ? "○" : "×"}`, face: `顔:${face ? "○" : "×"}` }[mode];
+  hud.textContent = `${fps | 0}fps   ${found}` + (linked ? "  🔗" : "");
 }
 loop();
 </script>
