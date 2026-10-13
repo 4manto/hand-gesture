@@ -6,7 +6,7 @@
 <title>Motion Capture</title>
 <style>
   body { margin: 0; background: #111; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
-  #row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  #row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; align-items: flex-start; }
   #stage { position: relative; background: #000; }
   #stage.sil video { opacity: 0; }
   video, #canvas { width: min(720px, 100vw); transform: scaleX(-1); display: block; }
@@ -36,7 +36,7 @@
     <button data-mode="pose"><b>全身</b><span>全身の骨格・体と腕の向き・シルエット</span></button>
     <button data-mode="face"><b>顔</b><span>顔のメッシュ(478点)・表情</span></button>
   </div>
-  <p><label>全身モデル <select id="poseModel"><option value="lite">軽い(lite)</option><option value="full">ふつう(full)</option><option value="heavy" selected>高精度(heavy)</option></select></label></p>
+  <p><label>全身モデル <select id="poseModel"><option value="lite">軽い(lite)</option><option value="full" selected>ふつう(full)</option><option value="heavy">高精度(heavy)</option></select></label></p>
 </div>
 <div id="hud" hidden></div>
 <div id="row" hidden>
@@ -59,8 +59,6 @@
 <div id="log"></div>
 
 <script type="module">
-import { FilesetResolver, GestureRecognizer, PoseLandmarker, FaceLandmarker, DrawingUtils }
-  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 const { smooth, prune } = (() => {
 // One Euro Filter: 静止時は強く平滑化、速い動きでは遅延を減らす
 // 調整: ブレが気になる → MIN_CUTOFF を下げる / 動きに遅れる → BETA を上げる
@@ -200,7 +198,6 @@ return { toward, facing, bodyNormal, bodyFacing, palmNormal, posePalm, armSides,
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), v3 = $("view3d"), hud = $("hud"), logEl = $("log");
 const ctx = canvas.getContext("2d"), ctx3 = v3.getContext("2d");
-const draw = new DrawingUtils(ctx);
 
 // ここにジェスチャーごとの処理を書く
 function onGesture(name, hand) {
@@ -232,24 +229,29 @@ async function create(Task, path, extra) {
   catch (e) { console.warn("GPU 不可、CPU で再試行", e); return await Task.createFromOptions(vision, { ...opts(path, "CPU"), ...extra }); }
 }
 
+// MediaPipe はモードを選んでから読み込む(スタート画面では何も動かさない)
+let FilesetResolver, GestureRecognizer, PoseLandmarker, FaceLandmarker, DrawingUtils;
 let vision, recognizer, poser, facer;
 try {
+  ({ FilesetResolver, GestureRecognizer, PoseLandmarker, FaceLandmarker, DrawingUtils } = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14"));
   vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
   recognizer = mode === "hand" && await create(GestureRecognizer, "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task", { numHands: 2 });
-  // 全身モデルはスタート画面で選ぶ(heavy = 最高精度、重い端末は full / lite)
+  // 全身モデルはスタート画面で選ぶ(既定 full。heavy は高精度だが重い)
   const pm = $("poseModel").value;
   poser = mode === "pose" && await create(PoseLandmarker, `pose_landmarker/pose_landmarker_${pm}/float16/1/pose_landmarker_${pm}.task`, {
     numPoses: 1,
-    outputSegmentationMasks: true, // シルエットモード用
+    outputSegmentationMasks: false, // シルエットを ON にしたときだけ出す(毎フレームの人物マスクは重い)
   });
   facer = mode === "face" && await create(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 1, outputFaceBlendshapes: true });
 } catch (e) { fail("モデルを読み込めませんでした。ネット接続を確認して、再読み込みしてください", e); }
+const draw = new DrawingUtils(ctx);
 
 hud.textContent = "カメラ起動中…";
 if (!navigator.mediaDevices?.getUserMedia) fail("このページではカメラを使えません(https か localhost で開いてください)");
 try {
-  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+  // モデルは内部で 256px 前後に縮めるので 640×360 で十分。画素数が 1/4 になり、転送とマスクの処理が軽くなる
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 360 } } });
 } catch (e) {
   fail({
     NotAllowedError: "カメラの使用が許可されていません。ブラウザの設定で許可して、再読み込みしてください",
@@ -289,10 +291,14 @@ const attach = (hw, w) => hw.map(p => ({ x: p.x - hw[0].x + w.x, y: p.y - hw[0].
 // --- シルエットモード(姿勢モデルのセグメンテーションマスク) ---
 const SIL_THRESHOLD = 0.5; // 人物と見なすマスク値
 let silhouette = false;
-$("silhouette").onclick = () => {
+let reconfiguring = false; // setOptions 中は推論しない
+$("silhouette").onclick = async () => {
   silhouette = !silhouette;
   $("silhouette").textContent = `シルエット: ${silhouette ? "ON" : "OFF"}`;
   $("stage").classList.toggle("sil", silhouette);
+  reconfiguring = true;
+  try { await poser.setOptions({ outputSegmentationMasks: silhouette }); }
+  finally { reconfiguring = false; } // 失敗しても推論は止めたままにしない
 };
 const SIL_LINE = 2; // 輪郭線の太さ(マスクのピクセル単位、GPU版は最大8)
 const resize = (c, w, h) => { if (c.width !== w || c.height !== h) Object.assign(c, { width: w, height: h }); };
@@ -332,7 +338,8 @@ const FINGER_K = 0.13; // 指の太さ(半径) = 手のひら幅 × これ。背
 const ZONE_K = 0.45;   // 色差で判定する範囲(骨格からの距離) = 手のひら幅 × これ
 
 const glCanvas = document.createElement("canvas");
-const gl = glCanvas.getContext("webgl2", { premultipliedAlpha: false, preserveDrawingBuffer: true });
+// シルエットは全身モードだけなので、他のモードでは WebGL を作らない
+const gl = mode === "pose" && glCanvas.getContext("webgl2", { premultipliedAlpha: false, preserveDrawingBuffer: true });
 const BONES = GestureRecognizer.HAND_CONNECTIONS;
 let P, T = {}, fbo, bgRead, bgWrite, glW = 0, glH = 0;
 
@@ -595,6 +602,7 @@ let lastVideoTime = -1, fps = 0, lastT = performance.now();
 function loop() {
   requestAnimationFrame(loop);
   if (video.currentTime === lastVideoTime) return; // 同じフレームを二重処理しない
+  if (reconfiguring) return;
   lastVideoTime = video.currentTime;
   const t = performance.now();
   fps += (1000 / (t - lastT) - fps) * 0.1;
