@@ -18,6 +18,6 @@ def inline(m):
 
 
 out, n = re.subn(r'^import\s*\{([^}]*)\}\s*from\s*"\./([\w.]+\.js)";', inline, src, flags=re.M)
-assert n == 2, f"expected 2 local imports, got {n}"
+assert n == 3, f"expected 3 local imports, got {n}"
 (here / "MotionCapture.html").write_text(out, encoding="utf-8")
 print(f"MotionCapture.html ({len(out) // 1024} KB)")

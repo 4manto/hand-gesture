@@ -61,6 +61,7 @@
 <script type="module">
 import { smooth, prune } from "./oneeuro.js";
 import { toward, facing, bodyNormal, bodyFacing, palmNormal, posePalm, armSides, applyCalibration, fingerBends } from "./orient.js";
+import { maskSmoother } from "./mask.js";
 
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), v3 = $("view3d"), hud = $("hud"), logEl = $("log");
@@ -163,11 +164,15 @@ $("silhouette").onclick = async () => {
   silhouette = !silhouette;
   $("silhouette").textContent = `シルエット: ${silhouette ? "ON" : "OFF"}`;
   $("stage").classList.toggle("sil", silhouette);
+  smoothMask.reset();
   reconfiguring = true;
   try { await poser.setOptions({ outputSegmentationMasks: silhouette }); }
   finally { reconfiguring = false; } // 失敗しても推論は止めたままにしない
 };
 const SIL_LINE = 2; // 輪郭線の太さ(マスクのピクセル単位、GPU版は最大8)
+// マスクのなめらかさ。チラつく→SIL_EMA を上げる(0〜0.9) / 輪郭がギザギザ→SIL_BLUR を上げる / 動きに遅れる→SIL_EMA を下げる
+const SIL_EMA = 0.5, SIL_BLUR = 2;
+const smoothMask = maskSmoother(SIL_EMA, SIL_BLUR);
 const resize = (c, w, h) => { if (c.width !== w || c.height !== h) Object.assign(c, { width: w, height: h }); };
 
 // 輪郭 = 内側の点のうち、上下左右 SIL_LINE 以内に外側がある点
@@ -420,7 +425,7 @@ function maskStats(m, w, h, step) {
 // 人物の輪郭を線で描き、人物の面積率・縦横比・処理時間を返す
 function drawSilhouette(mask, handLms) {
   const t0 = performance.now();
-  const w = mask.width, h = mask.height, m = mask.getAsFloat32Array();
+  const w = mask.width, h = mask.height, m = smoothMask(mask.getAsFloat32Array(), w, h);
   ctx.drawImage(silGPU ? edgeGPU(m, w, h, handLms, video) : edgeCPU(m, w, h), 0, 0, canvas.width, canvas.height);
   const s = maskStats(m, w, h, silGPU ? 2 : 1);
   if (!s) return null;

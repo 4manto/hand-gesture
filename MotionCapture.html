@@ -194,6 +194,54 @@ function applyCalibration(samples) {
 
 return { toward, facing, bodyNormal, bodyFacing, palmNormal, posePalm, armSides, applyCalibration, fingerBends };
 })();
+const { maskSmoother } = (() => {
+// 人物マスクをなめらかにする。暗い部屋などでマスクの値が 0.5 付近で揺れると、輪郭がガビガビになるため
+//  1. 時間方向: 前のフレームと混ぜてチラつきを抑える(ema = 前フレームの重み。大きいほど安定するが動きに遅れる)
+//  2. 空間方向: 箱型ぼかし(半径 r)で階段状のギザギザを丸める。累積和なので r に関係なく O(画素数)
+function maskSmoother(ema, r) {
+  let prev = null, tmp, out, col;
+  const cl = (v, hi) => v < 0 ? 0 : v > hi ? hi : v;
+  const fn = (m, w, h) => {
+    if (!prev || prev.length !== m.length) {
+      prev = Float32Array.from(m);
+      tmp = new Float32Array(m.length);
+      out = new Float32Array(m.length);
+      col = new Float32Array(w);
+    } else {
+      for (let i = 0; i < m.length; i++) prev[i] = prev[i] * ema + m[i] * (1 - ema);
+    }
+    const inv = 1 / (2 * r + 1);
+    // 横: 行ごとの累積和
+    for (let y = 0; y < h; y++) {
+      const o = y * w;
+      let s = 0;
+      for (let k = -r; k <= r; k++) s += prev[o + cl(k, w - 1)];
+      for (let x = 0; x < w; x++) {
+        tmp[o + x] = s * inv;
+        s += prev[o + cl(x + r + 1, w - 1)] - prev[o + cl(x - r, w - 1)];
+      }
+    }
+    // 縦: 列ごとの和を1行ずつ更新する(メモリを順に読むので、列単位に走査するより速い)
+    col.fill(0);
+    for (let k = -r; k <= r; k++) {
+      const o = cl(k, h - 1) * w;
+      for (let x = 0; x < w; x++) col[x] += tmp[o + x];
+    }
+    for (let y = 0; y < h; y++) {
+      const o = y * w, add = cl(y + r + 1, h - 1) * w, sub = cl(y - r, h - 1) * w;
+      for (let x = 0; x < w; x++) {
+        out[o + x] = col[x] * inv;
+        col[x] += tmp[add + x] - tmp[sub + x];
+      }
+    }
+    return out;
+  };
+  fn.reset = () => { prev = null; }; // シルエットを入れ直したとき、古いフレームを混ぜない
+  return fn;
+}
+
+return { maskSmoother };
+})();
 
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), v3 = $("view3d"), hud = $("hud"), logEl = $("log");
@@ -296,11 +344,15 @@ $("silhouette").onclick = async () => {
   silhouette = !silhouette;
   $("silhouette").textContent = `シルエット: ${silhouette ? "ON" : "OFF"}`;
   $("stage").classList.toggle("sil", silhouette);
+  smoothMask.reset();
   reconfiguring = true;
   try { await poser.setOptions({ outputSegmentationMasks: silhouette }); }
   finally { reconfiguring = false; } // 失敗しても推論は止めたままにしない
 };
 const SIL_LINE = 2; // 輪郭線の太さ(マスクのピクセル単位、GPU版は最大8)
+// マスクのなめらかさ。チラつく→SIL_EMA を上げる(0〜0.9) / 輪郭がギザギザ→SIL_BLUR を上げる / 動きに遅れる→SIL_EMA を下げる
+const SIL_EMA = 0.5, SIL_BLUR = 2;
+const smoothMask = maskSmoother(SIL_EMA, SIL_BLUR);
 const resize = (c, w, h) => { if (c.width !== w || c.height !== h) Object.assign(c, { width: w, height: h }); };
 
 // 輪郭 = 内側の点のうち、上下左右 SIL_LINE 以内に外側がある点
@@ -553,7 +605,7 @@ function maskStats(m, w, h, step) {
 // 人物の輪郭を線で描き、人物の面積率・縦横比・処理時間を返す
 function drawSilhouette(mask, handLms) {
   const t0 = performance.now();
-  const w = mask.width, h = mask.height, m = mask.getAsFloat32Array();
+  const w = mask.width, h = mask.height, m = smoothMask(mask.getAsFloat32Array(), w, h);
   ctx.drawImage(silGPU ? edgeGPU(m, w, h, handLms, video) : edgeCPU(m, w, h), 0, 0, canvas.width, canvas.height);
   const s = maskStats(m, w, h, silGPU ? 2 : 1);
   if (!s) return null;
