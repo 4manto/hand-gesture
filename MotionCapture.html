@@ -2,17 +2,18 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Motion Capture</title>
 <style>
   body { margin: 0; background: #111; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
   #row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
   #stage { position: relative; background: #000; }
   #stage.sil video { opacity: 0; }
-  video, #canvas { width: 720px; max-width: 100vw; transform: scaleX(-1); display: block; }
+  video, #canvas { width: min(720px, 100vw); transform: scaleX(-1); display: block; }
   #canvas { position: absolute; inset: 0; }
-  #view3d { background: #1b1b1b; max-width: 100vw; }
+  #view3d { background: #1b1b1b; width: min(480px, 100vw); height: auto; }
   #hud { font-size: 22px; margin: 12px; min-height: 1.4em; }
-  #log { font: 14px monospace; height: 8em; overflow: auto; width: 720px; max-width: 100vw; opacity: .7; white-space: pre; }
+  #log { font: 14px monospace; height: 8em; overflow: auto; width: min(720px, 100vw); opacity: .7; white-space: pre; }
   button { font-size: 16px; padding: 4px 12px; }
   #orient { font: 18px monospace; white-space: pre; margin-top: 8px; line-height: 1.5; }
   [hidden] { display: none !important; }
@@ -35,6 +36,7 @@
     <button data-mode="pose"><b>全身</b><span>全身の骨格・体と腕の向き・シルエット</span></button>
     <button data-mode="face"><b>顔</b><span>顔のメッシュ(478点)・表情</span></button>
   </div>
+  <p><label>全身モデル <select id="poseModel"><option value="lite">軽い(lite)</option><option value="full">ふつう(full)</option><option value="heavy" selected>高精度(heavy)</option></select></label></p>
 </div>
 <div id="hud" hidden></div>
 <div id="row" hidden>
@@ -215,30 +217,46 @@ $("row").hidden = false;
 for (const el of document.querySelectorAll("[data-modes]")) el.hidden = !el.dataset.modes.split(" ").includes(mode);
 $("modeChange").onclick = () => location.reload();
 hud.textContent = "モデル読み込み中…";
+// 失敗したら理由を画面に出して止める
+function fail(msg, e) {
+  hud.textContent = msg;
+  if (e) console.error(e);
+  throw e ?? new Error(msg);
+}
 
 const MODELS = "https://storage.googleapis.com/mediapipe-models";
-const vision = await FilesetResolver.forVisionTasks(
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-const opts = path => ({ baseOptions: { modelAssetPath: `${MODELS}/${path}`, delegate: "GPU" }, runningMode: "VIDEO" });
+const opts = (path, delegate) => ({ baseOptions: { modelAssetPath: `${MODELS}/${path}`, delegate }, runningMode: "VIDEO" });
+// GPU で作れない端末では CPU でやり直す
+async function create(Task, path, extra) {
+  try { return await Task.createFromOptions(vision, { ...opts(path, "GPU"), ...extra }); }
+  catch (e) { console.warn("GPU 不可、CPU で再試行", e); return await Task.createFromOptions(vision, { ...opts(path, "CPU"), ...extra }); }
+}
 
-const recognizer = mode === "hand" && await GestureRecognizer.createFromOptions(vision, {
-  ...opts("gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"),
-  numHands: 2,
-});
-// heavy = 最高精度。重ければ full / lite に変更
-const poser = mode === "pose" && await PoseLandmarker.createFromOptions(vision, {
-  ...opts("pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"),
-  numPoses: 1,
-  outputSegmentationMasks: true, // シルエットモード用
-});
-const facer = mode === "face" && await FaceLandmarker.createFromOptions(vision, {
-  ...opts("face_landmarker/face_landmarker/float16/1/face_landmarker.task"),
-  numFaces: 1,
-  outputFaceBlendshapes: true,
-});
+let vision, recognizer, poser, facer;
+try {
+  vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  recognizer = mode === "hand" && await create(GestureRecognizer, "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task", { numHands: 2 });
+  // 全身モデルはスタート画面で選ぶ(heavy = 最高精度、重い端末は full / lite)
+  const pm = $("poseModel").value;
+  poser = mode === "pose" && await create(PoseLandmarker, `pose_landmarker/pose_landmarker_${pm}/float16/1/pose_landmarker_${pm}.task`, {
+    numPoses: 1,
+    outputSegmentationMasks: true, // シルエットモード用
+  });
+  facer = mode === "face" && await create(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 1, outputFaceBlendshapes: true });
+} catch (e) { fail("モデルを読み込めませんでした。ネット接続を確認して、再読み込みしてください", e); }
 
 hud.textContent = "カメラ起動中…";
-video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+if (!navigator.mediaDevices?.getUserMedia) fail("このページではカメラを使えません(https か localhost で開いてください)");
+try {
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+} catch (e) {
+  fail({
+    NotAllowedError: "カメラの使用が許可されていません。ブラウザの設定で許可して、再読み込みしてください",
+    NotFoundError: "カメラが見つかりません",
+    NotReadableError: "カメラを他のアプリが使っています。閉じてから再読み込みしてください",
+  }[e.name] ?? `カメラを起動できませんでした: ${e.message}`, e);
+}
 await new Promise(r => video.onloadeddata = r);
 canvas.width = video.videoWidth;
 canvas.height = video.videoHeight;
